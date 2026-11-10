@@ -12,12 +12,6 @@ go run .
 
 The server listens on port 80.
 
-## Tests
-
-```
-go test ./...
-```
-
 ## Benchmark
 
 `BenchmarkServer` starts the server the same way `main` does (real clock, real
