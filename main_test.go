@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,104 +8,58 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"sync"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/pgnds/request_counter/internal/naive"
 )
 
-// benchmarkDuration is how long each BenchmarkServer variant sends requests.
-const benchmarkDuration = 10 * time.Second
+func BenchmarkNaive(b *testing.B) {
+	for _, n := range []int{1_000, 10_000, 50_000, 100_000, 500_000} {
+		b.Run(fmt.Sprintf("timestamps=%d", n), func(b *testing.B) {
+			file := filepath.Join(b.TempDir(), "naive.log")
+			writeTimestamps(b, file, n)
 
-// BenchmarkServer runs the server the way main does (real clock, real file
-// writes) and sends it real HTTP requests at a fixed rate for
-// benchmarkDuration. Each request is sent on schedule whether or not earlier
-// ones have been answered, like independent clients would. Requests still
-// unanswered a second after sending stops are counted as unanswered.
-// queued-writes is how many file writes were still waiting when sending
-// stopped: a large number means the server is falling behind even if it is
-// still answering quickly, because the queue hasn't filled up yet.
-//
-// Each variant runs once for a fixed time, so b.N and ns/op don't apply.
-func BenchmarkServer(b *testing.B) {
-	dir, err := os.MkdirTemp("", "request_counter_bench")
-	if err != nil {
-		b.Fatalf("could not create temp dir. err: %s", err)
-	}
-	defer os.RemoveAll(dir)
-	FILE_NAME = filepath.Join(dir, "request_timestamps.log")
-
-	for _, rps := range []int{10, 100, 1_000, 10_000} {
-		b.Run(fmt.Sprintf("rps=%d", rps), func(b *testing.B) {
-			// Start with a minute of history at this rate, as if the server had
-			// already been running, so the window is full from the first request.
-			history := make([]int64, 60*rps)
-			minuteAgo := time.Now().Unix() - 60
-			for i := range history {
-				history[i] = minuteAgo + int64(i/rps)
+			c, err := naive.New(file)
+			if err != nil {
+				b.Fatal(err)
 			}
+			server := httptest.NewServer(c)
+			defer server.Close()
 
-			rc := RequestCounter{
-				requests:              history,
-				latestCurrentRequests: make(chan []int64, 10_000),
-				getNowTime:            time.Now,
-			}
-			go WaitForFileWrites(rc.latestCurrentRequests)
-			server := httptest.NewServer(http.HandlerFunc(rc.HandleRequest))
-
-			client := &http.Client{Transport: &http.Transport{
-				MaxConnsPerHost:     1_000,
-				MaxIdleConnsPerHost: 1_000,
-			}}
-			ctx, cancel := context.WithTimeout(context.Background(), benchmarkDuration+time.Second)
-			defer cancel()
-
-			var (
-				wg        sync.WaitGroup
-				mu        sync.Mutex
-				latencies []time.Duration
-			)
-			sent := rps * int(benchmarkDuration/time.Second)
-			interval := time.Second / time.Duration(rps)
+			var latencies []time.Duration
 			start := time.Now()
-			for i := range sent {
-				time.Sleep(time.Until(start.Add(time.Duration(i) * interval)))
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					sentAt := time.Now()
-					req, _ := http.NewRequestWithContext(ctx, "GET", server.URL, nil)
-					resp, err := client.Do(req)
-					if err != nil {
-						return
-					}
-					io.Copy(io.Discard, resp.Body)
-					resp.Body.Close()
-					mu.Lock()
-					latencies = append(latencies, time.Since(sentAt))
-					mu.Unlock()
-				}()
-			}
-			wg.Wait()
-			queuedWrites := len(rc.latestCurrentRequests)
-
-			// Throw away the queued writes so handlers stuck on a full queue can
-			// finish, otherwise Close waits for the disk to catch up.
-			go func() {
-				for range rc.latestCurrentRequests {
+			for b.Loop() {
+				sent := time.Now()
+				resp, err := http.Get(server.URL)
+				if err != nil {
+					b.Fatal(err)
 				}
-			}()
-			server.Close()
-
-			answered := len(latencies)
-			b.ReportMetric(0, "ns/op")
-			b.ReportMetric(float64(answered)/benchmarkDuration.Seconds(), "answered/s")
-			b.ReportMetric(float64(sent-answered), "unanswered")
-			b.ReportMetric(float64(queuedWrites), "queued-writes")
-			if answered > 0 {
-				slices.Sort(latencies)
-				b.ReportMetric(latencies[answered/2].Seconds()*1000, "p50-ms")
-				b.ReportMetric(latencies[answered*99/100].Seconds()*1000, "p99-ms")
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				if resp.StatusCode != http.StatusOK {
+					b.Fatalf("status %d", resp.StatusCode)
+				}
+				latencies = append(latencies, time.Since(sent))
 			}
+			elapsed := time.Since(start)
+
+			slices.Sort(latencies)
+			b.ReportMetric(float64(len(latencies))/elapsed.Seconds(), "req/s")
+			b.ReportMetric(latencies[len(latencies)*90/100].Seconds()*1000, "p90(ms)")
 		})
+	}
+}
+
+func writeTimestamps(b *testing.B, file string, n int) {
+	b.Helper()
+	var sb strings.Builder
+	start := time.Now().Unix() - 50
+	for i := range n {
+		fmt.Fprintln(&sb, start+int64(i*50/n))
+	}
+	if err := os.WriteFile(file, []byte(sb.String()), 0o644); err != nil {
+		b.Fatal(err)
 	}
 }

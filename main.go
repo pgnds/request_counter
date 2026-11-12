@@ -1,91 +1,68 @@
 package main
 
 import (
-	"bufio"
-	"fmt"
+	"context"
+	"errors"
+	"flag"
 	"log"
+	"maps"
 	"net/http"
 	"os"
-	"sort"
-	"strconv"
-	"sync"
+	"os/signal"
+	"slices"
+	"strings"
+	"syscall"
 	"time"
+
+	"github.com/pgnds/request_counter/internal/counter"
+	"github.com/pgnds/request_counter/internal/naive"
 )
 
-var FILE_NAME string = "request_timestamps.log"
-
-type RequestCounter struct {
-	sync.Mutex
-	requests              []int64
-	latestCurrentRequests chan []int64
-	getNowTime            func() time.Time // makes testing easier
+var counters = map[string]func(file string) (counter.Counter, error){
+	"naive": naive.New,
 }
 
 func main() {
-	backupRequests := ReadTimestampsFromFile()
-	rc := RequestCounter{
-		requests:              backupRequests,
-		latestCurrentRequests: make(chan []int64, 10_000),
-		getNowTime:            time.Now,
+	names := strings.Join(slices.Sorted(maps.Keys(counters)), ", ")
+
+	name := flag.String("counter", "naive", "counter implementation:"+names)
+	flag.Parse()
+
+	newCounter, ok := counters[*name]
+	if !ok {
+		log.Fatalf("unknown counter %q, choose one of: %s", *name, names)
 	}
 
-	go WaitForFileWrites(rc.latestCurrentRequests)
-
-	http.HandleFunc("/", rc.HandleRequest)
-	log.Fatal(http.ListenAndServe(":80", nil))
-}
-
-func (rc *RequestCounter) HandleRequest(w http.ResponseWriter, r *http.Request) {
-	// take timestamps when the request was received to avoid lock hiding true time
-	requestTimestamp := rc.getNowTime().Unix()
-	lastMinuteTimestamp := requestTimestamp - 60
-
-	rc.Lock()
-	rc.requests = append(rc.requests, requestTimestamp)
-	// Discard request timestamps older than 1 minute using binary search for efficiency
-	index := sort.Search(len(rc.requests), func(i int) bool {
-		return rc.requests[i] >= lastMinuteTimestamp
-	})
-	rc.requests = rc.requests[index:]
-	rc.latestCurrentRequests <- rc.requests
-	rc.Unlock()
-
-	fmt.Fprint(w, strconv.Itoa(len(rc.requests)))
-}
-
-func ReadTimestampsFromFile() []int64 {
-	file, err := os.OpenFile(FILE_NAME, os.O_CREATE|os.O_RDONLY, 0666)
+	counter, err := newCounter(*name + ".log")
 	if err != nil {
-		log.Fatalf("could not open file %s. error: %s", FILE_NAME, err)
+		log.Fatal(err)
 	}
-	defer file.Close()
 
-	fileRequests := []int64{}
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := scanner.Text()
-		value, err := strconv.ParseInt(line, 10, 64)
-		if err != nil {
-			log.Printf("could not convert timestamp from line %s. error: %s", line, err)
-			continue
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	server := &http.Server{Addr: ":80", Handler: counter}
+	go func() {
+		err := server.ListenAndServe()
+		if !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal(err)
 		}
-		fileRequests = append(fileRequests, value)
+	}()
+
+	// wait for Ctrl-C signal
+	<-ctx.Done()
+
+	// stop taking requests, let in-flight finish (5 seconds deadline)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err = server.Shutdown(shutdownCtx)
+	if err != nil {
+		log.Print(err)
 	}
 
-	if err := scanner.Err(); err != nil {
-		log.Fatalf("error occurred while reading file %s. error: %s", FILE_NAME, err)
-	}
-
-	return fileRequests
-}
-
-func WaitForFileWrites(latestCurrentRequests chan []int64) {
-	for {
-		currentRequests := <-latestCurrentRequests
-		fileContent := []byte{}
-		for _, reqTime := range currentRequests {
-			fileContent = append(fileContent, []byte(fmt.Sprintf("%d\n", reqTime))...)
-		}
-		os.WriteFile(FILE_NAME, fileContent, 0666)
+	// save counters state before exit
+	err = counter.Close()
+	if err != nil {
+		log.Fatal(err)
 	}
 }
